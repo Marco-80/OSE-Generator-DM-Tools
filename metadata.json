@@ -1,0 +1,5 @@
+{
+  "name": "OSE Generator & DM Tools",
+  "description": "Un generatore completo per Old-School Essentials (React, Vite, Tailwind, Lucide).",
+  "requestFramePermissions": []
+}

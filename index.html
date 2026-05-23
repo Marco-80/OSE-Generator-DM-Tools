@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OSE Generator - Vanilla</title>
+    <!-- Tailwind CSS (CDN per utilizzo senza NodeJS. Puoi rimuoverlo se passi tutto a Bootstrap) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['system-ui', 'sans-serif'],
+                        serif: ['Georgia', 'serif'],
+                        mono: ['monospace']
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- jQuery -->
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Regole minime */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        body { margin: 0; padding: 0; }
+    </style>
+</head>
+<body>
+    <div id="root">
+        <div class="p-10 text-center text-gray-500 font-sans animate-pulse">
+            Caricamento app in OSE Generator (Vanilla)...
+        </div>
+    </div>
+    <!-- Logica di App convertita in JS Puro -->
+    <script src="/app.js"></script>
+</body>
+</html>
