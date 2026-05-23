@@ -2,11 +2,8 @@
 <img width="1200" height="475" alt="RZBanner" src="[https://ai.google.dev/static/site-assets/images/share-ais-513315318.png](https://drive.google.com/file/d/1gc9_cZq-mXPgL212r5Jvii8inl2zrAp9/view?usp=drive_link)" />
 </div>
 
-# Run and deploy your AI Studio app
 
-This contains everything you need to run your app locally.
-
-View your app in AI Studio: https://ai.studio/apps/5d1cafa5-83c3-4b2c-bb1a-00e104f31393
+https://ai.studio/apps/5d1cafa5-83c3-4b2c-bb1a-00e104f31393
 
 ## Run Locally
 
