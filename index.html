@@ -36,7 +36,30 @@
             Caricamento app in OSE Generator (Vanilla)...
         </div>
     </div>
-    <!-- Logica di App convertita in JS Puro -->
-    <script src="/app.js"></script>
+    <!-- Logica di App convertita in JS Puro (supporta sia root che sotto-cartelle come GitHub Pages) -->
+    <script>
+        (function() {
+            function loadScript(src, fallback) {
+                var s = document.createElement('script');
+                s.src = src;
+                s.onload = function() { window.appLoaded = true; };
+                s.onerror = function() {
+                    if (fallback) {
+                        var f = document.createElement('script');
+                        f.src = fallback;
+                        f.onload = function() { window.appLoaded = true; };
+                        f.onerror = function() {
+                            var f2 = document.createElement('script');
+                            f2.src = './public/app.js';
+                            document.body.appendChild(f2);
+                        };
+                        document.body.appendChild(f);
+                    }
+                };
+                document.body.appendChild(s);
+            }
+            loadScript('app.js', './app.js');
+        })();
+    </script>
 </body>
 </html>

@@ -48,8 +48,25 @@ var App = (() => {
   ));
 
   // src/main.ts
-  var import_jquery = { default: window.jQuery || window.$ };
-  var import_lucide = window.lucide;
+  var import_jquery = {
+    get default() {
+      return typeof window !== "undefined" ? (window.jQuery || window.$) : null;
+    }
+  };
+  var import_lucide = {
+    createIcons: function(opts) {
+      try {
+        if (typeof window !== "undefined" && window.lucide && typeof window.lucide.createIcons === "function") {
+          window.lucide.createIcons(opts || {});
+        }
+      } catch (e) {
+        console.warn("Lucide error:", e);
+      }
+    },
+    get icons() {
+      return (typeof window !== "undefined" && window.lucide) ? window.lucide.icons : {};
+    }
+  };
 
   // src/lib/ose-data.ts
   var ARMORS = [
@@ -803,7 +820,10 @@ var App = (() => {
     let remaining = cfg.totalPoints;
     const biasMap = { low: -0.9, normal: 0, high: 0.9 };
     const varianceMap = { low: 0.55, medium: 1.15, high: 2.2 };
-    const bias = (_a = biasMap[cfg.powerProfile]) != null ? _a : 0;
+    let bias = (_a = biasMap[cfg.powerProfile]) != null ? _a : 0;
+    if (cfg.powerProfile === 'random') {
+      bias = (rng() * 1.8) - 0.9;
+    }
     const variance = (_b = varianceMap[cfg.varianceProfile]) != null ? _b : 1.15;
     for (let i = 0; i < cfg.statsCount; i++) {
       const left = cfg.statsCount - i - 1;
@@ -824,7 +844,7 @@ var App = (() => {
       return [];
     }
     const all = [];
-    function backtrack(pos, remaining, current) {
+    function backtrack(pos, remaining, current, usedSet) {
       if (pos === cfg.statsCount) {
         if (remaining === 0)
           all.push([...current]);
@@ -834,12 +854,15 @@ var App = (() => {
       const low = Math.max(cfg.minValue, remaining - left * cfg.maxValue);
       const high = Math.min(cfg.maxValue, remaining - left * cfg.minValue);
       for (let v = low; v <= high; v++) {
+        if (cfg.noRepeats && usedSet.has(v)) continue;
         current.push(v);
-        backtrack(pos + 1, remaining - v, current);
+        if (cfg.noRepeats) usedSet.add(v);
+        backtrack(pos + 1, remaining - v, current, usedSet);
+        if (cfg.noRepeats) usedSet.delete(v);
         current.pop();
       }
     }
-    backtrack(0, cfg.totalPoints, []);
+    backtrack(0, cfg.totalPoints, [], new Set());
     return all;
   }
   function shuffleInPlace(arr, rng) {
@@ -856,13 +879,37 @@ var App = (() => {
         customVals = parsed;
       }
     }
-    const totalPossible = cfg.mode === "sum" ? countPossibleStrings(cfg) : 9999999;
-    const target = Math.min(cfg.count, totalPossible);
+    
+    const getHash = (arr) => {
+        if (cfg.precision === 'unordered') {
+            return [...arr].sort((a,b)=>a-b).join("|");
+        }
+        return arr.join("|");
+    };
+
+    let results = [];
+    let totalPossible = cfg.mode === "sum" ? countPossibleStrings(cfg) : 9999999;
+    
+    // Il target è SEMPRE il count richiesto.
+    const target = Math.min(cfg.count, 99999);
     const rng = cfg.seed !== null ? mulberry32(cfg.seed) : Math.random;
-    const found = /* @__PURE__ */ new Map();
-    const maxAttempts = Math.max(target * 500, 1e4);
+    const maxAttempts = Math.min(Math.max(target * 1000, 5e4), 200000);
     let attempts = 0;
-    while (found.size < target && attempts < maxAttempts) {
+    
+    // Se richiede una quantita vicina o superiore al totale (e precisione exact e richiede unique), allora enumera direttamente:
+    if (cfg.generateAll && target >= totalPossible && cfg.precision === 'exact' && cfg.mode === 'sum') {
+        let all = enumerateAll(cfg);
+        if (cfg.requireMin) all = all.filter(s => s.includes(cfg.minValue));
+        if (cfg.requireMax) all = all.filter(s => s.includes(cfg.maxValue));
+        shuffleInPlace(all, rng);
+        results = all.slice(0, target);
+        return { results, totalPossible: all.length };
+    }
+
+    const foundMap = new Map();
+    const foundList = []; // per consentire doppioni
+
+    while ((cfg.generateAll ? foundMap.size : foundList.length) < target && attempts < maxAttempts) {
       let s;
       if (customVals) {
         s = [...customVals];
@@ -870,6 +917,24 @@ var App = (() => {
       } else {
         s = randomString(cfg, rng);
       }
+      
+      if (cfg.requireMin && !s.includes(cfg.minValue)) {
+        attempts++;
+        continue;
+      }
+      if (cfg.requireMax && !s.includes(cfg.maxValue)) {
+        attempts++;
+        continue;
+      }
+
+      if (cfg.noRepeats) {
+        const uniqueInSet = new Set(s);
+        if (uniqueInSet.size !== cfg.statsCount) {
+          attempts++;
+          continue;
+        }
+      }
+
       if (cfg.mode === "unique_values" && !customVals) {
         const uniqueVals = new Set(s);
         if (uniqueVals.size !== cfg.statsCount) {
@@ -877,17 +942,44 @@ var App = (() => {
           continue;
         }
       }
-      found.set(s.join("|"), s);
+      
+      const hash = getHash(s);
+      if (cfg.generateAll) {
+          foundMap.set(hash, s);
+      } else {
+          foundList.push(s);
+      }
       attempts++;
     }
-    let results = Array.from(found.values());
-    if (results.length < target && cfg.mode === "sum") {
-      results = enumerateAll(cfg);
-      shuffleInPlace(results, rng);
-      results = results.slice(0, target);
+    
+    results = cfg.generateAll ? Array.from(foundMap.values()) : foundList;
+    if (results.length < target && cfg.mode === "sum" && attempts >= maxAttempts) {
+      // Come fallback per evitare loop appesi (se unique è true e non le trova), enumeriamo e prendiamo
+      let all = enumerateAll(cfg);
+      if (cfg.requireMin) all = all.filter(s => s.includes(cfg.minValue));
+      if (cfg.requireMax) all = all.filter(s => s.includes(cfg.maxValue));
+      if (cfg.generateAll) {
+          const tempMap = new Map();
+          for(const s of all) tempMap.set(getHash(s), s);
+          let allUnique = Array.from(tempMap.values());
+          shuffleInPlace(allUnique, rng);
+          results = allUnique.slice(0, target);
+      } else {
+          // Se non c'è bisogno di unicità e non è riuscito a riempire (strano), lo riempiamo prendendo a caso da `all`
+          while (results.length < target && all.length > 0) {
+              results.push([...all[Math.floor(rng() * all.length)]]);
+          }
+      }
     } else {
+      // Se avevamo unique = false, mescoliamo? Se unique = true, results è map values quindi in ordine casuale se gli inserimenti sono casuali, ma diamo una passata.
       shuffleInPlace(results, rng);
     }
+    
+    // Se siamo su unordered update the possible combos stat per far vedere quante ne sono uscite
+    if (cfg.precision === 'unordered' && cfg.mode === 'sum') {
+       totalPossible = null; // We didn't exactly count unordered max combos
+    }
+
     return { results, totalPossible };
   };
   var getXpBonus = (stats, primeReq) => {
@@ -2822,12 +2914,17 @@ Gruppo: colpiti 1d4 bersagli.`
     characterArchive: JSON.parse(localStorage.getItem("ose_archive") || "[]"),
     statsConfig: {
       totalPoints: 72,
-      count: 1,
+      count: 10,
       statsCount: 6,
-      minValue: 8,
-      maxValue: 16,
+      minValue: 3,
+      maxValue: 18,
+      requireMin: false,
+      requireMax: false,
+      noRepeats: false,
       powerProfile: "normal",
       varianceProfile: "high",
+      precision: "exact",
+      generateAll: false,
       mode: "sum",
       seed: null,
       customString: ""
@@ -2838,9 +2935,22 @@ Gruppo: colpiti 1d4 bersagli.`
   };
   var CLASSES = Object.keys(CLASS_DATA);
   var ALIGNMENTS = ["Legale", "Neutrale", "Caotico"];
-  (0, import_jquery.default)(function() {
-    initApp();
-  });
+  
+  function launchApp() {
+    if (typeof document !== "undefined") {
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", function() {
+          setTimeout(initApp, 10);
+        });
+      } else {
+        setTimeout(initApp, 10);
+      }
+    }
+  }
+  launchApp();
+  if (typeof window !== "undefined") {
+    window.initApp = initApp;
+  }
   function initApp() {
     renderUI();
     bindEvents();
@@ -2891,10 +3001,11 @@ Gruppo: colpiti 1d4 bersagli.`
             </main>
 
             <footer class="bg-stone-900 text-stone-400 py-6 text-center text-xs mt-auto border-t border-stone-800">
-                <div class="max-w-7xl mx-auto px-4">
-                    <p class="font-bold mb-1">© 2026 RegolaZero. Di Marco Scaruffi.</p>
-                    <p class="opacity-75">Old-School Essentials è un marchio registrato di Necrotic Gnome. Tutti i diritti riservati.</p>
-                    <p class="opacity-75 mt-2">Nessun server richiesto. Funziona al 100% nel tuo browser (Vanilla).</p>
+                <div class="max-w-7xl mx-auto px-4 space-y-1.5">
+                    <p class="font-bold text-stone-300">© 2026 RegolaZero. Di Marco Scaruffi.</p>
+                    <p class="text-stone-400">Strumento amatoriale, gratuito e non ufficiale. Marchi, regole e ambientazioni appartengono ai rispettivi editori e autori.</p>
+                    <p class="text-stone-500 text-[11px]">Old-School Essentials è un marchio registrato di Necrotic Gnome. Edizione italiana a cura di Need Games! Tutti i diritti riservati.</p>
+                    <p class="text-stone-500 text-[11px] pt-1">Nessun server richiesto. Funziona al 100% nel tuo browser (Vanilla).</p>
                 </div>
             </footer>
         </div>
@@ -2963,6 +3074,24 @@ Gruppo: colpiti 1d4 bersagli.`
       state.character.stats[stat] = val;
       renderCharacterTab();
     });
+    (0, import_jquery.default)(document).on("click", "#btn-gen-name", function() {
+      const cls = state.character.class;
+      state.character.name = generateOscName(cls);
+      (0, import_jquery.default)("#char-name").val(state.character.name);
+      (0, import_jquery.default)("#header-char-name").text(state.character.name);
+    });
+    (0, import_jquery.default)(document).on("click", ".btn-reroll-inventory", function() {
+      const equip = generateRandomEquipment(state.character.class, state.character.level);
+      state.character.armor = equip.armor;
+      state.character.shield = equip.shield;
+      state.character.weapon1 = equip.weapon1;
+      state.character.weapon2 = equip.weapon2;
+      state.character.equipment = equip.equipment;
+      renderCharacterTab();
+    });
+    (0, import_jquery.default)(document).on("change", "#stats-no-repeats", function() {
+      state.statsConfig.noRepeats = (0, import_jquery.default)(this).is(":checked");
+    });
     (0, import_jquery.default)(document).on("click", ".btn-generate-stats", function() {
       rollRandomCharacter();
     });
@@ -2983,7 +3112,280 @@ Gruppo: colpiti 1d4 bersagli.`
         renderCharacterTab();
       }
     });
+    (0, import_jquery.default)(document).on("click", ".btn-print-char", function() {
+      const derived = getDerived();
+      const ac = getAC();
+      const saves = getSaves();
+      const html = generatePrintHTML(state, derived, ac, saves);
+      const printWindow = window.open('', '', 'width=800,height=1000');
+      if (printWindow) {
+        printWindow.document.write(html);
+        printWindow.document.close();
+      } else {
+        alert("Il pop-up per la stampa è stato bloccato dal browser. Per favore, consenti i pop-up per questo sito.");
+      }
+    });
+
+    (0, import_jquery.default)(document).on("click", ".btn-export-char-json", function() {
+      const c = state.character;
+      const derived = getDerived();
+      const ac = getAC();
+      const saves = getSaves();
+      const exportData = {
+          character: c,
+          derived: derived,
+          ac: ac,
+          saves: saves
+      };
+      const json = JSON.stringify(exportData, null, 2);
+      downloadFile(`pg_${c.name.replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'senza_nome'}.json`, json, "application/json");
+    });
   }
+
+  function generateOscName(cls) {
+    const dwarfNames = ["Thorin", "Dain", "Gimli", "Balin", "Dwalin", "Oin", "Gloin", "Fili", "Kili", "Bofur", "Bombur", "Durin", "Morgrim", "Grom", "Borek", "Thrum", "Kazador", "Alrik", "Brokk", "Duergar"];
+    const dwarfSurnames = ["Pietrafitta", "Barbadiferro", "Spaccapietra", "Incudine", "Scudodirame", "Fonderoccia", "Minabronzo", "Scavagrotte", "Rocciacuore", "Martellocupa", "Fieroscudo", "Granito", "Barbabianca"];
+    
+    const elfNames = ["Legolas", "Thranduil", "Elrond", "Celeborn", "Haldir", "Glorfindel", "Galadriel", "Arwen", "Tauriel", "Finarfin", "Aerin", "Eryna", "Faelar", "Kaelen", "Silas", "Theron", "Alassë", "Eldarion"];
+    const elfSurnames = ["Sussurravvento", "Lunachiara", "Fogliaverde", "Stellafulgida", "Cantabosco", "Ombrabianca", "Fiord'argento", "Alborosato", "Ramoselvaggio", "Cielonero", "Luceaurora", "Boscoantico"];
+    
+    const halflingNames = ["Frodo", "Sam", "Merry", "Pippin", "Bilbo", "Rosie", "Mungo", "Pim", "Bungo", "Lalia", "Drogo", "Gildor", "Fosco", "Tolman", "Berylla", "Belba"];
+    const halflingSurnames = ["Piedelesto", "Baggins", "Brandibuck", "Buoncorpo", "Sottocolle", "Verdecampi", "Fossacalda", "Spigadoro", "Tuttotondo", "Panciapiatta", "Cinquefoglie", "Collidolcide"];
+    
+    const humanNames = ["Aragorn", "Boromir", "Faramir", "Theoden", "Eomer", "Eowyn", "Garth", "Bran", "Jon", "Robb", "Ned", "Arthur", "Uther", "Gawain", "Lancelot", "Galahad", "Ector", "Merlin", "Valerius", "Septimus", "Lucius", "Aldo", "Corvo", "Goffredo", "Baldovino", "Ruggero", "Tancredi"];
+    const humanSurnames = ["Valerius", "Blackwood", "Ravencrest", "Montague", "Castelbruno", "Falcobruno", "di Rivaverde", "Rocciafonda", "Pietrascura", "Silvario", "Altacorte", "Mareanera", "Corvino", "Martello", "di Valfiorita", "Castiglione", "Montechiaro", "Bellafonte"];
+    
+    const orcNames = ["Grommash", "Thrall", "Garrosh", "Durotan", "Morg", "Guz", "Broxigar", "Ugluk", "Grishnakh", "Gorbag", "Shagrat", "Kragor", "Thorg", "Brak", "Ghor"];
+    const orcSurnames = ["Spaccatesta", "Zannaguzza", "Pellecupa", "Furia", "Scannalupi", "Torvofauce", "Laceracarne", "Occhiotruce", "Zannarotta", "Spaccabraccia"];
+    
+    const svirfNames = ["Belwar", "Schnick", "Gurn", "Krieger", "Thulwirt", "Zarn", "Beldaram", "Trosper", "Bimpnottin", "Fonkin", "Namfoodle"];
+    const svirfSurnames = ["Gemmascura", "Picconero", "Scavaprofondo", "Pietragrigia", "Cristallofuso", "Profondomanto", "Venaferro", "Bucaombra"];
+
+    let namePool = humanNames;
+    let surnamePool = humanSurnames;
+
+    if (cls === "Nano") {
+      namePool = dwarfNames;
+      surnamePool = dwarfSurnames;
+    } else if (cls === "Elfo" || cls === "Illusionista") {
+      namePool = elfNames;
+      surnamePool = elfSurnames;
+    } else if (cls === "Halfling") {
+      namePool = halflingNames;
+      surnamePool = halflingSurnames;
+    } else if (cls === "Mezzorco") {
+      namePool = orcNames;
+      surnamePool = orcSurnames;
+    } else if (cls === "Mezzelfo") {
+      namePool = elfNames.concat(humanNames);
+      surnamePool = elfSurnames.concat(humanSurnames);
+    } else if (cls === "Svirfneblin") {
+      namePool = svirfNames;
+      surnamePool = svirfSurnames;
+    }
+
+    const first = namePool[Math.floor(Math.random() * namePool.length)];
+    // No nicknames or sobriquets, only proper fantasy name or name + surname
+    const withSurname = Math.random() < 0.65;
+    if (withSurname) {
+      const surname = surnamePool[Math.floor(Math.random() * surnamePool.length)];
+      return `${first} ${surname}`;
+    }
+    return first;
+  }
+
+  function generatePrintHTML(state, derived, ac, saves) {
+    const c = state.character;
+    let languages = "Comune, Allineamento";
+    if (c.stats.int >= 13 && c.stats.int <= 15) languages += " + 1 addizionale";
+    if (c.stats.int >= 16 && c.stats.int <= 17) languages += " + 2 addizionali";
+    if (c.stats.int === 18) languages += " + 3 addizionali";
+    const formatMod = (m) => m > 0 ? '+' + m : m;
+    
+    const baseSA = 9 - (derived.dis || 0);
+    const currentAC = ac;
+    const spellSection = c.spells && c.spells.length > 0 ? `\n\nIncantesimi:\n${c.spells.map(s => s.name).join(', ')}` : '';
+
+    return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Scheda: ${c.name || 'Senza Nome'}</title>
+      <style>
+        @page { size: A4 portrait; margin: 0; }
+        @media print {
+            html, body { margin: 0; padding: 0; width: 210mm; height: 297mm; overflow: hidden; background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            .page-container { margin: 0; padding: 6mm 8mm; width: 100%; height: 290mm; max-height: 290mm; box-shadow: none; border: none; overflow: hidden; }
+        }
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #eee; color: #000; margin: 0; padding: 0; box-sizing: border-box; display: flex; justify-content: center; }
+        .page-container { width: 210mm; max-height: 295mm; background: white; padding: 6mm 8mm; box-sizing: border-box; box-shadow: 0 0 10px rgba(0,0,0,0.1); margin: 10px 0; overflow: hidden; }
+        * { box-sizing: border-box; }
+        .f-row { display: flex; width: 100%; margin-bottom: 3px; align-items: flex-end; }
+        .f-col { display: flex; flex-direction: column; }
+        .b-box { background: #000; color: #fff; font-weight: bold; padding: 3px 5px; text-align: center; border: 1px solid #000; min-width: 45px; font-size: 15px; text-transform: uppercase;}
+        .b-val { border-bottom: 1px solid #000; font-size: 14px; padding: 2px 6px; flex-grow: 1; font-weight: bold;}
+        .i-lbl { font-size: 10px; text-transform: uppercase; margin-left: 5px; margin-top: 1px;}
+        
+        .header-logo { font-size: 40px; font-weight: 900; line-height: 0.9; letter-spacing: -1px; text-transform: uppercase; font-family: Impact, sans-serif;}
+        .header-sub { background: #000; color: #fff; padding: 2px 8px; font-size: 15px; font-weight: bold; display: inline-block; letter-spacing: 1px;}
+        
+        .title-bar { border-bottom: 2px solid #000; font-family: Impact, sans-serif; font-size: 22px; letter-spacing: 1px; text-transform: uppercase; margin-top: 8px; margin-bottom: 4px; padding-bottom: 1px; line-height:1;}
+        
+        .s-box { background: #000; color: #fff; font-size: 14px; font-weight: bold; width: 38px; display: flex; align-items: center; justify-content: center; height: 28px;}
+        .s-val { border: 2px solid #000; width: 38px; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: bold; height: 28px; box-sizing: border-box;}
+        .s-desc { font-size: 10.5px; margin-left: 6px; line-height: 1.1; font-style: italic; width: 125px; display: flex; align-items: center;}
+        
+        .pf-box { height: 44px; font-size: 20px; text-align: center; display: flex; justify-content: center; align-items: center; flex: 1; border: 2px solid #000; font-weight:bold;}
+        .ca-box { height: 44px; font-size: 24px; text-align: center; display: flex; justify-content: center; align-items: center; flex: 1; border: 2px solid #000; font-weight:bold;}
+        
+        .notes { border: 1px solid #000; padding: 6px; font-size: 10.5px; min-height: 70px; white-space: pre-wrap; font-family: monospace; line-height: 1.25;}
+      </style>
+    </head>
+    <body onload="setTimeout(function() { window.print(); }, 500)">
+      <div class="page-container">
+      <div style="display: flex; gap: 16px;">
+        <div style="flex: 2;">
+          <div class="f-row">
+            <div class="b-box">PG</div><div class="b-val">${c.name || ''}</div>
+          </div>
+          <div class="f-row" style="margin-top:14px;">
+            <div style="flex: 1; margin-right: 10px;">
+              <div class="f-row"><div class="b-box" style="font-size:12px;">Classe</div><div class="b-val" style="font-size:13px;">${c.class}</div></div>
+            </div>
+            <div style="flex: 1; margin-right: 10px;">
+              <div class="f-row"><div class="b-box" style="font-size:12px;">AL</div><div class="b-val" style="font-size:13px;">${c.alignment}</div></div>
+            </div>
+          </div>
+          <div class="f-row" style="margin-top:8px;">
+            <div style="flex: 1; margin-right: 10px;">
+              <div class="f-row"><div class="b-box" style="font-size:12px;">Titolo</div><div class="b-val"></div></div>
+            </div>
+            <div style="flex: 1; margin-right: 10px;">
+              <div class="f-row"><div class="b-box" style="font-size:12px;">Livello</div><div class="b-val" style="font-size:13px;">${c.level}</div></div>
+            </div>
+          </div>
+        </div>
+        <div style="flex: 1; text-align: right; padding-top: 2px;">
+          <div class="header-logo">OLD-SCHOOL<br>ESSENTIALS</div>
+          <div class="header-sub">SCHEDA DEL PERSONAGGIO</div>
+        </div>
+      </div>
+      
+      <div style="display: flex; gap: 16px;">
+        <div style="flex: 1;">
+          <div class="title-bar" style="margin-top:14px;">CARATTERISTICHE</div>
+          <div class="f-col">
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">FOR</div><div class="s-val">${c.stats.str}</div><div class="s-desc">Attacchi mischia, Porte (Mod: ${formatMod(derived.mis)})</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">INT</div><div class="s-val">${c.stats.int}</div><div class="s-desc">Lingue, Alfabeto (Mod: ${formatMod(derived.intMod)})</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">SAG</div><div class="s-val">${c.stats.wis}</div><div class="s-desc">TS contro magia (Mod: ${formatMod(derived.sag)})</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">DES</div><div class="s-val">${c.stats.dex}</div><div class="s-desc">Att. dist, CA, Iniz. (Mod: ${formatMod(derived.dis)})</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">COS</div><div class="s-val">${c.stats.con}</div><div class="s-desc">Punti ferita agg. (Mod: ${formatMod(derived.cos)})</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">CAR</div><div class="s-val">${c.stats.cha}</div><div class="s-desc">Reazioni, Seguaci (Mod: ${formatMod(derived.rea)})</div></div>
+          </div>
+          <div style="font-size:10px; font-style:italic; border-bottom: 1px solid #ccc; padding-bottom: 3px; margin-top:3px;">Tiro Caratteristiche: pari o sotto con 1d20</div>
+        </div>
+        <div style="flex: 1;">
+          <div class="title-bar" style="margin-top:14px;">TIRI SALVEZZA</div>
+          <div class="f-col">
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">M</div><div class="s-val">${saves.d || '-'}</div><div class="s-desc">Morte, veleno</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">B</div><div class="s-val">${saves.w || '-'}</div><div class="s-desc">Bacchette</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">P</div><div class="s-val">${saves.p || '-'}</div><div class="s-desc">Paralisi, pietrificazione</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">S</div><div class="s-val">${saves.b || '-'}</div><div class="s-desc">Soffio</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box">I</div><div class="s-val">${saves.s || '-'}</div><div class="s-desc">Incantesimi, verghe</div></div>
+            <div class="f-row" style="margin-bottom:6px;"><div class="s-box" style="font-size:20px;">±</div><div class="s-val">${formatMod(derived.sag)}</div><div class="s-desc">Mod. SAG ai TS magia</div></div>
+          </div>
+          <div style="font-size:10px; font-style:italic; border-bottom: 1px solid #ccc; padding-bottom: 3px; margin-top:3px;">Tiro Salvezza: pari o sopra con 1d20</div>
+        </div>
+        <div style="flex: 1;">
+          <div style="width: 100%; height: 185px; border: 2px solid #000; margin-top: 10px;"></div>
+          <div class="i-lbl" style="text-align: center; margin-top: 4px;">Ritratto del personaggio / Simbolo</div>
+        </div>
+      </div>
+      
+      <div style="display: flex; gap: 16px; align-items:flex-start; margin-top: 4px;">
+         <div style="flex: 2;">
+             <div class="title-bar">COMBATTIMENTO</div>
+             <div style="display: flex; gap: 8px;">
+                 <div style="flex: 1;">
+                     <div class="f-row"><div class="b-box" style="height:52px; display:flex; align-items:center;">PF</div><div class="pf-box">${c.hp}</div></div>
+                     <div style="text-align:right; font-size:10px; font-style:italic;">Punti Ferita</div>
+                 </div>
+                 <div style="flex: 1.4; display:flex; flex-direction:column; justify-content:space-between;">
+                     <div class="f-row"><div class="s-box">Max</div><div class="b-val" style="border: 1px solid #000; height:30px; text-align:center;">${c.hp}</div></div>
+                     <div class="f-row" style="margin-top:4px;"><div class="s-box" style="font-size:18px;">±</div><div class="b-val" style="border: 1px solid #000; height:30px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.cos)}</div></div>
+                 </div>
+             </div>
+             
+             <div style="display: flex; gap: 8px; margin-top: 10px;">
+                 <div style="flex: 1;">
+                     <div class="f-row"><div class="b-box" style="height:52px; display:flex; align-items:center;">CA</div><div class="ca-box">${currentAC}</div></div>
+                     <div style="text-align:right; font-size:10px; font-style:italic;">Classe Armatura</div>
+                 </div>
+                 <div style="flex: 1.4; display:flex; flex-direction:column; justify-content:space-between;">
+                     <div class="f-row"><div class="s-box">SA</div><div class="b-val" style="border: 1px solid #000; height:30px; display:flex; align-items:center; justify-content:center;">${baseSA}</div></div>
+                     <div class="f-row" style="margin-top:4px;"><div class="s-box" style="font-size:18px;">±</div><div class="b-val" style="border: 1px solid #000; height:30px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.dis)}</div></div>
+                 </div>
+             </div>
+             
+             <div style="display: flex; gap: 8px; margin-top: 10px;">
+                 <div style="flex: 1;" class="f-row">
+                     <div class="b-box">Mis</div>
+                     <div class="b-val" style="border: 1px solid #000; height: 28px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.mis)}</div>
+                 </div>
+                 <div style="flex: 1;" class="f-row">
+                     <div class="b-box">Dis</div>
+                     <div class="b-val" style="border: 1px solid #000; height: 28px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.dis)}</div>
+                 </div>
+             </div>
+             
+             <div class="title-bar" style="font-size:18px;">ABILITÀ E ARMI</div>
+             <div class="notes" style="min-height: 110px;">Arma Mischia: ${c.weapon1 || 'Nessuna'}
+Arma Distanza: ${c.weapon2 || 'Nessuna'}
+
+Equipaggiamento:
+${c.equipment || 'N/A'}
+
+Note classe: ${c.notes || ''}${spellSection}</div>
+         </div>
+         
+         <div style="flex: 1;">
+             <div class="title-bar">INCONTRI</div>
+             <div class="f-row" style="margin-bottom:6px;"><div class="s-box" style="width:45px;">Iniz.</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.dis)}</div></div>
+             <div class="f-row"><div class="s-box" style="width:45px; font-size:18px;">±</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${formatMod(derived.rea)}</div></div>
+             
+             <div class="title-bar">ESPLORAZIONE</div>
+             <div class="f-row" style="margin-bottom:5px;"><div class="s-box">OP</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${c.class==="Elfo"||c.class==="Svirfneblin"?2:1}</div><div style="font-size:12px; font-weight:bold; margin-left:4px;">su-6</div></div>
+             <div class="f-row" style="margin-bottom:5px;"><div class="s-box">AP</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${derived.openDoors.split('-')[0]}</div><div style="font-size:12px; font-weight:bold; margin-left:4px;">su-6</div></div>
+             <div class="f-row" style="margin-bottom:5px;"><div class="s-box">TP</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${c.class==="Elfo"?2:1}</div><div style="font-size:12px; font-weight:bold; margin-left:4px;">su-6</div></div>
+             <div class="f-row"><div class="s-box">CT</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; justify-content:center;">${c.class==="Nano"?2:1}</div><div style="font-size:12px; font-weight:bold; margin-left:4px;">su-6</div></div>
+             
+             <div class="title-bar">MOVIMENTO (base ${parseInt(derived.movement)}' )</div>
+             <div class="f-row" style="margin-bottom:5px;"><div class="s-box">Vi</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; padding-left:8px;">${parseInt(derived.movement) / 5} km/g</div></div>
+             <div class="f-row" style="margin-bottom:5px;"><div class="s-box">Es</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; padding-left:8px;">${parseInt(derived.movement)}'</div></div>
+             <div class="f-row"><div class="s-box">In</div><div class="b-val" style="border:1px solid #000; height:28px; display:flex; align-items:center; padding-left:8px;">${Math.floor(parseInt(derived.movement)/3)}'</div></div>
+             
+             <div class="title-bar">MATRICE TPC</div>
+             <table style="width: 100%; text-align: center; font-size: 12px; font-weight: bold; border-collapse: collapse; margin-top: 4px; margin-bottom: 4px;">
+                <tr>
+                    ${[9,8,7,6,5,4,3,2,1,0].map(ac => `<td style="border: 1.5px solid #000; background: #000; color: #fff; padding: 3px 1px;">${ac}</td>`).join('')}
+                </tr>
+                <tr>
+                    ${[9,8,7,6,5,4,3,2,1,0].map(ac => `<td style="border: 1.5px solid #000; padding: 3px 1px;">${derived.thac0 - ac}</td>`).join('')}
+                </tr>
+             </table>
+             
+             <div class="title-bar">LINGUE</div>
+             <div class="notes" style="min-height:35px; padding: 4px;">
+                 ${languages}
+             </div>
+         </div>
+      </div>
+      </div>
+    </body>
+    </html>
+    `;
+  }
+
   function renderTabContent() {
     const $main = (0, import_jquery.default)("#main-content");
     $main.empty();
@@ -3035,7 +3437,13 @@ Gruppo: colpiti 1d4 bersagli.`
       xpBonus: getXpBonus(statsArr, classInfo.prime),
       openDoors: getOpenDoors(cStats.str),
       movement: getMovement(classInfo.movement, 0),
-      thac0: levelInfo.thac0
+      thac0: levelInfo.thac0,
+      mis: getModifier(cStats.str),
+      dis: getModifier(cStats.dex),
+      cos: getModifier(cStats.con),
+      sag: getModifier(cStats.wis),
+      intMod: getModifier(cStats.int),
+      rea: getModifier(cStats.cha)
     };
   }
   function roll3d62() {
@@ -3148,7 +3556,12 @@ Gruppo: colpiti 1d4 bersagli.`
                     <div class="p-6 space-y-4">
                         <div>
                             <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Nome Eroe</label>
-                            <input type="text" id="char-name" value="${state.character.name}" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg outline-none" />
+                            <div class="flex gap-2">
+                                <input type="text" id="char-name" value="${state.character.name}" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg outline-none" />
+                                <button id="btn-gen-name" class="px-3 py-2 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-lg shadow-sm transition-colors" title="Genera Nome Casuale">
+                                    <i data-lucide="dice-5" class="w-5 h-5"></i>
+                                </button>
+                            </div>
                         </div>
                         <div class="grid grid-cols-2 gap-4">
                             <div>
@@ -3171,10 +3584,19 @@ Gruppo: colpiti 1d4 bersagli.`
                         
                         <div class="pt-4 flex flex-col gap-2">
                             <button class="btn-generate-stats bg-white border border-stone-300 hover:bg-stone-100 text-stone-800 px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all focus:ring-2 focus:ring-stone-500 focus:outline-none">
-                                <i data-lucide="refresh-cw" class="w-4 h-4"></i> Tira Statistiche (Casuale)
+                                <i data-lucide="refresh-cw" class="w-4 h-4 text-purple-600"></i> Tira Statistiche (Casuale)
+                            </button>
+                            <button class="btn-reroll-inventory bg-white border border-stone-300 hover:bg-stone-100 text-stone-800 px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all focus:ring-2 focus:ring-stone-500 focus:outline-none">
+                                <i data-lucide="package" class="w-4 h-4 text-purple-600"></i> Ritira Inventario
                             </button>
                             <button class="btn-save-char bg-purple-600 hover:bg-purple-700 text-white border border-purple-700 px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all focus:ring-2 focus:ring-purple-500 focus:outline-none">
                                 <i data-lucide="save" class="w-4 h-4"></i> Salva Personaggio
+                            </button>
+                            <button class="btn-print-char bg-stone-800 hover:bg-stone-900 text-white border border-stone-800 px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all focus:ring-2 focus:ring-stone-500 focus:outline-none mt-1">
+                                <i data-lucide="printer" class="w-4 h-4"></i> Stampa Scheda Personaggio
+                            </button>
+                            <button class="btn-export-char-json bg-blue-600 hover:bg-blue-700 text-white border border-blue-700 px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all focus:ring-2 focus:ring-blue-500 focus:outline-none mt-1">
+                                <i data-lucide="download" class="w-4 h-4"></i> Esporta JSON
                             </button>
                         </div>
                     </div>
@@ -3267,9 +3689,14 @@ Gruppo: colpiti 1d4 bersagli.`
 
                     <!-- Equipaggiamento -->
                     <div class="mt-12 pt-8 border-t">
-                        <h3 class="text-sm font-black text-gray-500 uppercase tracking-widest mb-4 flex items-center gap-2">
-                            <i data-lucide="shield" class="w-4 h-4 text-stone-500"></i> Equipaggiamento
-                        </h3>
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-sm font-black text-gray-500 uppercase tracking-widest flex items-center gap-2">
+                                <i data-lucide="shield" class="w-4 h-4 text-stone-500"></i> Equipaggiamento
+                            </h3>
+                            <button class="btn-reroll-inventory text-xs bg-stone-100 hover:bg-stone-200 border border-stone-300 text-stone-700 px-3 py-1 rounded-lg flex items-center gap-1.5 font-bold shadow-xs transition-colors cursor-pointer">
+                                <i data-lucide="refresh-cw" class="w-3.5 h-3.5 text-purple-600"></i> Ritira Inventario
+                            </button>
+                        </div>
                         <div class="bg-gray-50 rounded-xl p-4 border border-stone-200 text-stone-800 text-sm space-y-4 shadow-sm">
                             <div class="grid grid-cols-2 gap-4">
                                 <div>
@@ -3306,6 +3733,7 @@ Gruppo: colpiti 1d4 bersagli.`
     (0, import_lucide.createIcons)({ icons: import_lucide.icons });
   }
   function renderStatsTab() {
+    let currentStatsStrArr = [];
     const updateStatsStr = () => {
         let statsStrArr = [];
         let infoText = "";
@@ -3313,14 +3741,17 @@ Gruppo: colpiti 1d4 bersagli.`
             const data = generateUnique(state.statsConfig);
             if(data.results.length) {
                 statsStrArr = data.results;
+                currentStatsStrArr = data.results;
                 if(data.totalCombinations) {
                     infoText = `Trovate ${data.results.length} combinazioni su un massimo teorico di ${data.totalCombinations.toLocaleString('it-IT')}`;
                 }
             } else {
                 infoText = "Nessuna combinazione trovata per i parametri scelti.";
+                currentStatsStrArr = [];
             }
         } catch(e) {
             infoText = "Errore durante la generazione.";
+            currentStatsStrArr = [];
         }
         
         const html2 = statsStrArr.map((str, idx) => `
@@ -3341,8 +3772,45 @@ Gruppo: colpiti 1d4 bersagli.`
         
         (0, import_jquery.default)("#stats-results").html(html2);
         (0, import_jquery.default)("#stats-info").text(infoText);
+        
+        if (currentStatsStrArr.length > 0) {
+            (0, import_jquery.default)("#export-buttons").css("display", "flex");
+        } else {
+            (0, import_jquery.default)("#export-buttons").css("display", "none");
+        }
+        
         (0, import_lucide.createIcons)({ icons: import_lucide.icons });
     };
+
+    const downloadFile = (filename, content, type) => {
+        const blob = new Blob([content], { type: type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
+    (0, import_jquery.default)(document).off("click", "#btn-export-txt").on("click", "#btn-export-txt", function() {
+        if (!currentStatsStrArr.length) return;
+        const txt = "FOR\tINT\tSAG\tDES\tCOS\tCAR\n" + currentStatsStrArr.map(s => s.join("\t")).join("\n");
+        downloadFile("statistiche.txt", txt, "text/plain");
+    });
+    
+    (0, import_jquery.default)(document).off("click", "#btn-export-csv").on("click", "#btn-export-csv", function() {
+        if (!currentStatsStrArr.length) return;
+        const csv = "FOR,INT,SAG,DES,COS,CAR\n" + currentStatsStrArr.map(s => s.join(",")).join("\n");
+        downloadFile("statistiche.csv", csv, "text/csv");
+    });
+    
+    (0, import_jquery.default)(document).off("click", "#btn-export-json").on("click", "#btn-export-json", function() {
+        if (!currentStatsStrArr.length) return;
+        const json = JSON.stringify(currentStatsStrArr.map(s => ({ FOR: s[0], INT: s[1], SAG: s[2], DES: s[3], COS: s[4], CAR: s[5] })), null, 2);
+        downloadFile("statistiche.json", json, "application/json");
+    });
 
     (0, import_jquery.default)(document).off("click", "#btn-generate-stats-list").on("click", "#btn-generate-stats-list", function() {
         state.statsConfig.count = parseInt((0, import_jquery.default)("#stats-count").val()) || 10;
@@ -3350,10 +3818,30 @@ Gruppo: colpiti 1d4 bersagli.`
         state.statsConfig.mode = String((0, import_jquery.default)("#stats-mode").val());
         state.statsConfig.varianceProfile = String((0, import_jquery.default)("#stats-variance").val());
         state.statsConfig.powerProfile = String((0, import_jquery.default)("#stats-power").val());
+        state.statsConfig.precision = String((0, import_jquery.default)("#stats-precision").val());
+        state.statsConfig.generateAll = (0, import_jquery.default)("#stats-generate-all").is(":checked");
+        state.statsConfig.requireMin = (0, import_jquery.default)("#stats-require-min").is(":checked");
+        state.statsConfig.requireMax = (0, import_jquery.default)("#stats-require-max").is(":checked");
         state.statsConfig.minValue = parseInt((0, import_jquery.default)("#stats-min").val()) || 3;
         state.statsConfig.maxValue = parseInt((0, import_jquery.default)("#stats-max").val()) || 18;
         state.statsConfig.customString = String((0, import_jquery.default)("#stats-custom").val());
+        
+        // Handle UI update if generated all was toggled
+        if (state.statsConfig.generateAll) {
+            (0, import_jquery.default)("#stats-count").prop("disabled", true).addClass("opacity-50");
+        } else {
+            (0, import_jquery.default)("#stats-count").prop("disabled", false).removeClass("opacity-50");
+        }
+        
         updateStatsStr();
+    });
+    
+    (0, import_jquery.default)(document).off("change", "#stats-generate-all").on("change", "#stats-generate-all", function() {
+        if ((0, import_jquery.default)(this).is(":checked")) {
+            (0, import_jquery.default)("#stats-count").prop("disabled", true).addClass("opacity-50");
+        } else {
+            (0, import_jquery.default)("#stats-count").prop("disabled", false).removeClass("opacity-50");
+        }
     });
 
     (0, import_jquery.default)(document).off("click", ".btn-apply-stats").on("click", ".btn-apply-stats", function() {
@@ -3410,16 +3898,22 @@ Gruppo: colpiti 1d4 bersagli.`
 
                         <div>
                             <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1 pointer-events-none select-none">Numero di Set Generati</label>
-                            <input type="number" id="stats-count" value="${state.statsConfig.count > 1 ? state.statsConfig.count : 10}" max="100" class="w-full p-2 border border-gray-300 rounded bg-white outline-none text-sm focus:border-stone-500" />
+                            <input type="number" id="stats-count" value="${state.statsConfig.count > 1 ? state.statsConfig.count : 10}" max="100000" class="w-full p-2 border border-gray-300 rounded bg-white outline-none text-sm focus:border-stone-500" />
                         </div>
                         
                         <div class="grid grid-cols-2 gap-2 border-t pt-4">
                             <div>
-                                <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1 pointer-events-none select-none">Minimo</label>
+                                <div class="flex items-center justify-between mb-1">
+                                    <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest pointer-events-none select-none">Minimo</label>
+                                    <label class="flex items-center gap-1 text-[10px] font-bold text-gray-500 uppercase cursor-pointer"><input type="checkbox" id="stats-require-min" ${state.statsConfig.requireMin ? 'checked' : ''}> Esigi</label>
+                                </div>
                                 <input type="number" id="stats-min" value="${state.statsConfig.minValue}" min="3" max="18" class="w-full p-2 border border-gray-300 rounded bg-white text-center outline-none text-sm font-bold" />
                             </div>
                             <div>
-                                <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1 pointer-events-none select-none">Massimo</label>
+                                <div class="flex items-center justify-between mb-1">
+                                    <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest pointer-events-none select-none">Massimo</label>
+                                    <label class="flex items-center gap-1 text-[10px] font-bold text-gray-500 uppercase cursor-pointer"><input type="checkbox" id="stats-require-max" ${state.statsConfig.requireMax ? 'checked' : ''}> Esigi</label>
+                                </div>
                                 <input type="number" id="stats-max" value="${state.statsConfig.maxValue}" min="3" max="18" class="w-full p-2 border border-gray-300 rounded bg-white text-center outline-none text-sm font-bold" />
                             </div>
                         </div>
@@ -3437,7 +3931,32 @@ Gruppo: colpiti 1d4 bersagli.`
                             <select id="stats-power" class="w-full p-2.5 bg-gray-50 border border-gray-300 rounded outline-none text-sm font-bold cursor-pointer">
                                 <option value="normal" ${state.statsConfig.powerProfile === 'normal' ? 'selected' : ''}>Normale (Centro esatto)</option>
                                 <option value="min-max" ${state.statsConfig.powerProfile === 'min-max' ? 'selected' : ''}>Verso gli estremi</option>
+                                <option value="random" ${state.statsConfig.powerProfile === 'random' ? 'selected' : ''}>Casuale</option>
                             </select>
+                        </div>
+                        
+                        <div class="pt-2">
+                            <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1 pointer-events-none select-none">Livello Precisione Unicità</label>
+                            <select id="stats-precision" class="w-full p-2.5 bg-gray-50 border border-gray-300 rounded outline-none text-sm font-bold cursor-pointer">
+                                <option value="exact" ${state.statsConfig.precision === 'exact' ? 'selected' : ''}>Ordine Esatto (es: FOR 18 ≠ DES 18)</option>
+                                <option value="unordered" ${state.statsConfig.precision === 'unordered' ? 'selected' : ''}>Senza Ordine (es: 18,10,10 = 10,18,10)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="pt-3 border-t">
+                            <label class="flex items-center gap-2 cursor-pointer pb-1 font-bold text-sm select-none">
+                                <input type="checkbox" id="stats-no-repeats" ${state.statsConfig.noRepeats ? "checked" : ""} class="rounded scale-125 ml-1 accent-purple-600" /> 
+                                <span class="text-stone-800 font-bold">Nessun valore ripetuto nel set</span>
+                            </label>
+                            <p class="text-[9px] text-gray-400 font-mono tracking-wider ml-1 leading-snug">Garantisce che ciascuna delle 6 caratteristiche abbia un punteggio differente nel singolo set.</p>
+                        </div>
+                        
+                        <div class="pt-2">
+                            <label class="flex items-center gap-2 cursor-pointer pb-1.5 font-bold text-sm select-none">
+                                <input type="checkbox" id="stats-generate-all" ${state.statsConfig.generateAll ? "checked" : ""} class="rounded scale-125 ml-1 accent-stone-800" /> 
+                                <span class="text-stone-700">Tutte combinazioni diverse tra loro</span>
+                            </label>
+                            <p class="text-[9px] text-gray-400 font-mono tracking-wider ml-1 mt-0.5 leading-snug">Garantisce che non ci siano doppi tra i set generati.</p>
                         </div>
                     </div>
                     
@@ -3454,6 +3973,17 @@ Gruppo: colpiti 1d4 bersagli.`
                         <h3 class="font-serif font-bold text-lg text-emerald-800 flex items-center gap-2">
                             <i data-lucide="list" class="w-5 h-5"></i> Risultati
                         </h3>
+                        <div class="gap-2" id="export-buttons" style="display:none;">
+                            <button id="btn-export-txt" class="p-1.5 bg-stone-200 text-stone-700 hover:bg-stone-300 rounded shadow-sm transition-colors flex items-center gap-1 font-bold text-[10px]" title="Esporta in TXT">
+                                <i data-lucide="file-text" class="w-4 h-4"></i> TXT
+                            </button>
+                            <button id="btn-export-csv" class="p-1.5 bg-stone-200 text-stone-700 hover:bg-stone-300 rounded shadow-sm transition-colors flex items-center gap-1 font-bold text-[10px]" title="Esporta in CSV">
+                                <i data-lucide="table-2" class="w-4 h-4"></i> CSV
+                            </button>
+                            <button id="btn-export-json" class="p-1.5 bg-stone-200 text-stone-700 hover:bg-stone-300 rounded shadow-sm transition-colors flex items-center gap-1 font-bold text-[10px]" title="Esporta in JSON">
+                                <i data-lucide="code-2" class="w-4 h-4"></i> JSON
+                            </button>
+                        </div>
                     </div>
                     <div id="stats-results" class="p-6 space-y-2 overflow-y-auto flex-1 bg-gray-50/50">
                         <div class="h-full flex items-center justify-center">

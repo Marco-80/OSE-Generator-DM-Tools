@@ -1,5 +1,6 @@
 {
   "name": "OSE Generator & DM Tools",
   "description": "Un generatore completo per Old-School Essentials (React, Vite, Tailwind, Lucide).",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
